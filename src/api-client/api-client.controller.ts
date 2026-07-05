@@ -19,7 +19,7 @@ class CreateApiClientDto {
  * Internal-only endpoint for provisioning API clients.
  * In production, protect this with an internal network policy or admin token.
  */
-@Controller('api/v1/internal/clients')
+@Controller('internal/clients')
 export class ApiClientController {
   constructor(private readonly authService: AuthService) {}
 
