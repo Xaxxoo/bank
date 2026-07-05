@@ -3,6 +3,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { databaseConfig } from './config/database.config';
 import { AuthModule } from './auth/auth.module';
+import { AccountsModule } from './accounts/accounts.module';
 import { ApiClientController } from './api-client/api-client.controller';
 
 @Module({
@@ -13,6 +14,7 @@ import { ApiClientController } from './api-client/api-client.controller';
       useFactory: (config: ConfigService) => databaseConfig(config),
     }),
     AuthModule,
+    AccountsModule,
   ],
   controllers: [ApiClientController],
 })
