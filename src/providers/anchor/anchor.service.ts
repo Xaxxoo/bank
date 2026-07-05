@@ -11,6 +11,10 @@ import {
   AnchorCreateDepositAccountRequest,
   AnchorCustomer,
   AnchorDepositAccount,
+  AnchorNameEnquiryRequest,
+  AnchorNameEnquiryResult,
+  AnchorInitiateTransferRequest,
+  AnchorTransfer,
   AnchorApiResponse,
 } from './anchor.types';
 
@@ -107,6 +111,96 @@ export class AnchorService {
       return response.data.data;
     } catch (err) {
       this.handleAnchorError(err, 'getDepositAccount');
+    }
+  }
+
+  // ─── Name Enquiry ─────────────────────────────────────────────────────────
+
+  /**
+   * Resolves an account name before a transfer is initiated.
+   * Routes through Anchor → NIBSS NIP name enquiry service.
+   */
+  async nameEnquiry(
+    accountNumber: string,
+    bankCode: string,
+  ): Promise<AnchorNameEnquiryResult> {
+    const payload: AnchorNameEnquiryRequest = {
+      data: {
+        type: 'NameEnquiry',
+        attributes: { accountNumber, bankCode },
+      },
+    };
+
+    try {
+      const response = await this.http.post<AnchorApiResponse<AnchorNameEnquiryResult>>(
+        '/transfers/name-enquiry',
+        payload,
+      );
+      return response.data.data;
+    } catch (err) {
+      this.handleAnchorError(err, 'nameEnquiry');
+    }
+  }
+
+  // ─── Transfers ────────────────────────────────────────────────────────────
+
+  /**
+   * Initiates an inter-bank transfer via NIBSS NIP through Anchor.
+   * amount must be in kobo.
+   */
+  async initiateTransfer(
+    sourceAnchorAccountId: string,
+    destinationAccountNumber: string,
+    destinationBankCode: string,
+    amountKobo: number,
+    narration: string,
+    reference: string,
+  ): Promise<AnchorTransfer> {
+    const payload: AnchorInitiateTransferRequest = {
+      data: {
+        type: 'NIPTransfer',
+        attributes: {
+          amount: amountKobo,
+          currency: 'NGN',
+          narration,
+          destinationAccountNumber,
+          destinationBankCode,
+          reference,
+        },
+        relationships: {
+          sourceAccount: {
+            data: { type: 'DepositAccount', id: sourceAnchorAccountId },
+          },
+        },
+      },
+    };
+
+    try {
+      const response = await this.http.post<AnchorApiResponse<AnchorTransfer>>(
+        '/transfers',
+        payload,
+      );
+      this.logger.log(
+        `Anchor transfer initiated: ${response.data.data.id} | ref: ${reference}`,
+      );
+      return response.data.data;
+    } catch (err) {
+      this.handleAnchorError(err, 'initiateTransfer');
+    }
+  }
+
+  /**
+   * Fetches the current status of a transfer from Anchor.
+   * Used to reconcile transfers that were left in PENDING/PROCESSING state.
+   */
+  async getTransfer(anchorTransferId: string): Promise<AnchorTransfer> {
+    try {
+      const response = await this.http.get<AnchorApiResponse<AnchorTransfer>>(
+        `/transfers/${anchorTransferId}`,
+      );
+      return response.data.data;
+    } catch (err) {
+      this.handleAnchorError(err, 'getTransfer');
     }
   }
 
