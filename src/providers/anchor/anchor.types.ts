@@ -62,6 +62,72 @@ export interface AnchorDepositAccount {
   };
 }
 
+// ─── Name Enquiry ─────────────────────────────────────────────────────────────
+
+export interface AnchorNameEnquiryRequest {
+  data: {
+    type: 'NameEnquiry';
+    attributes: {
+      accountNumber: string;
+      bankCode: string;
+    };
+  };
+}
+
+export interface AnchorNameEnquiryResult {
+  accountNumber: string;
+  accountName: string;
+  bankCode: string;
+  responseCode: string;   // '00' = success
+  responseMessage: string;
+}
+
+// ─── NIP Transfer ─────────────────────────────────────────────────────────────
+
+export interface AnchorInitiateTransferRequest {
+  data: {
+    type: 'NIPTransfer';
+    attributes: {
+      amount: number;        // in kobo
+      currency: 'NGN';
+      narration: string;
+      destinationAccountNumber: string;
+      destinationBankCode: string;
+      reference: string;     // unique per transfer, used for idempotency
+    };
+    relationships: {
+      sourceAccount: {
+        data: {
+          type: 'DepositAccount';
+          id: string;        // Anchor deposit account ID
+        };
+      };
+    };
+  };
+}
+
+export interface AnchorTransfer {
+  id: string;
+  type: 'NIPTransfer';
+  attributes: {
+    amount: number;          // in kobo
+    currency: 'NGN';
+    narration: string;
+    destinationAccountNumber: string;
+    destinationAccountName: string;
+    destinationBankCode: string;
+    reference: string;
+    sessionId: string;       // NIBSS NIP session ID — critical for disputes
+    status: 'PENDING' | 'PROCESSING' | 'SUCCESSFUL' | 'FAILED' | 'REVERSED';
+    responseCode: string;
+    responseMessage: string;
+    createdAt: string;
+    updatedAt: string;
+  };
+}
+
+// ─── Shared ───────────────────────────────────────────────────────────────────
+
 export interface AnchorApiError {
   errors: Array<{
     title: string;
