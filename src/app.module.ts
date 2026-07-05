@@ -4,6 +4,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { databaseConfig } from './config/database.config';
 import { AuthModule } from './auth/auth.module';
 import { AccountsModule } from './accounts/accounts.module';
+import { TransfersModule } from './transfers/transfers.module';
 import { ApiClientController } from './api-client/api-client.controller';
 
 @Module({
@@ -15,6 +16,7 @@ import { ApiClientController } from './api-client/api-client.controller';
     }),
     AuthModule,
     AccountsModule,
+    TransfersModule,
   ],
   controllers: [ApiClientController],
 })
