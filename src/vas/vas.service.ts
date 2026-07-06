@@ -16,9 +16,11 @@ import { LedgerEntry, EntryType } from '../database/entities/ledger-entry.entity
 import { Account, AccountStatus } from '../database/entities/account.entity';
 import { ApiClient } from '../database/entities/api-client.entity';
 import { VTPassService } from '../providers/vtpass/vtpass.service';
+import { WebhooksService } from '../webhooks/webhooks.service';
+import { WebhookEvent } from '../webhooks/dto/update-webhook.dto';
 import { PurchaseAirtimeDto } from './dto/purchase-airtime.dto';
 import { PurchaseDataDto } from './dto/purchase-data.dto';
-import { ListVasTransactionsDto, VasType } from './dto/list-vas-transactions.dto';
+import { ListVasTransactionsDto } from './dto/list-vas-transactions.dto';
 import { DataNetworkOperator } from '../providers/vtpass/vtpass.types';
 
 @Injectable()
@@ -33,13 +35,13 @@ export class VasService {
     @InjectRepository(Account)
     private readonly accountRepo: Repository<Account>,
     private readonly vtpassService: VTPassService,
+    private readonly webhooksService: WebhooksService,
     private readonly dataSource: DataSource,
   ) {}
 
   // ─── POST /vas/airtime ────────────────────────────────────────────────────
 
   async purchaseAirtime(dto: PurchaseAirtimeDto, apiClient: ApiClient) {
-    // Idempotency
     const existing = await this.transactionRepo.findOne({ where: { reference: dto.reference } });
     if (existing) return this.toVasResponse(existing);
 
@@ -48,7 +50,6 @@ export class VasService {
 
     this.assertSufficientBalance(debitAccount, amountKobo);
 
-    // Create pending transaction before hitting VTPass
     const transaction = await this.transactionRepo.save(
       this.transactionRepo.create({
         reference: dto.reference,
@@ -80,11 +81,21 @@ export class VasService {
         status: TransactionStatus.FAILED,
         failure_reason: err?.message ?? 'VAS provider error',
       });
+      const failed = await this.transactionRepo.findOne({ where: { id: transaction.id } });
+      if (failed) {
+        await this.webhooksService.deliver(
+          apiClient,
+          WebhookEvent.VAS_FAILED,
+          this.toVasResponse(failed),
+        );
+      }
       throw err;
     }
 
     const updated = await this.transactionRepo.findOne({ where: { id: transaction.id } });
-    return this.toVasResponse(updated!);
+    const response = this.toVasResponse(updated!);
+    await this.webhooksService.deliver(apiClient, WebhookEvent.VAS_COMPLETED, response);
+    return response;
   }
 
   // ─── GET /vas/data/bundles ────────────────────────────────────────────────
@@ -142,11 +153,21 @@ export class VasService {
         status: TransactionStatus.FAILED,
         failure_reason: err?.message ?? 'VAS provider error',
       });
+      const failed = await this.transactionRepo.findOne({ where: { id: transaction.id } });
+      if (failed) {
+        await this.webhooksService.deliver(
+          apiClient,
+          WebhookEvent.VAS_FAILED,
+          this.toVasResponse(failed),
+        );
+      }
       throw err;
     }
 
     const updated = await this.transactionRepo.findOne({ where: { id: transaction.id } });
-    return this.toVasResponse(updated!);
+    const response = this.toVasResponse(updated!);
+    await this.webhooksService.deliver(apiClient, WebhookEvent.VAS_COMPLETED, response);
+    return response;
   }
 
   // ─── GET /vas/transactions/:reference ────────────────────────────────────
@@ -182,7 +203,6 @@ export class VasService {
       .take(dto.limit ?? 20);
 
     if (dto.type) {
-      // Filter by narration prefix since we encode type in narration
       qb.andWhere('tx.narration ILIKE :type', { type: `${dto.type}%` });
     }
 
