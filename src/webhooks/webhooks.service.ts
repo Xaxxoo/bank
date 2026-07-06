@@ -1,10 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { InjectQueue } from '@nestjs/bull';
 import { Repository } from 'typeorm';
-import axios from 'axios';
-import * as crypto from 'crypto';
+import * as Bull from 'bull';
 import { ApiClient } from '../database/entities/api-client.entity';
 import { UpdateWebhookDto, WebhookEvent } from './dto/update-webhook.dto';
+import { WEBHOOK_DELIVERY_QUEUE } from './webhooks.constants';
+import { WebhookJobData } from '../workers/webhook-delivery/webhook-delivery.processor';
 
 export interface WebhookPayload {
   event: WebhookEvent;
@@ -19,6 +21,8 @@ export class WebhooksService {
   constructor(
     @InjectRepository(ApiClient)
     private readonly apiClientRepo: Repository<ApiClient>,
+    @InjectQueue(WEBHOOK_DELIVERY_QUEUE)
+    private readonly webhookQueue: Bull.Queue<WebhookJobData>,
   ) {}
 
   // ─── GET /webhooks ─────────────────────────────────────────────────────────
@@ -51,46 +55,33 @@ export class WebhooksService {
   // ─── Webhook Delivery (called internally after events) ────────────────────
 
   /**
-   * Delivers a webhook event to the API client's configured URL.
-   * Signs the payload with HMAC-SHA256 using the client's private_key_hash
-   * so the receiver can verify authenticity.
+   * Enqueues a webhook delivery job for the given event.
    *
-   * Signature is sent in the `x-pulsemfb-signature` header.
-   * Retry logic should be handled by the queue (BullMQ) in production.
+   * The job is processed by WebhookDeliveryProcessor with 5 attempts and
+   * exponential backoff so transient endpoint failures are automatically
+   * retried without blocking the caller.
+   *
+   * Silently skips if the client has no webhook URL or has not subscribed
+   * to this event type.
    */
-  async deliver(apiClient: ApiClient, event: WebhookEvent, data: Record<string, any>): Promise<void> {
+  async deliver(
+    apiClient: ApiClient,
+    event: WebhookEvent,
+    data: Record<string, any>,
+  ): Promise<void> {
     if (!apiClient.webhook_url) return;
     if (!apiClient.webhook_events?.includes(event)) return;
 
-    const payload: WebhookPayload = {
-      event,
-      data,
-      timestamp: new Date().toISOString(),
-    };
+    await this.webhookQueue.add(
+      { apiClientId: apiClient.id, event, data },
+      {
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 5_000 },
+        removeOnComplete: true,
+        removeOnFail: false,
+      },
+    );
 
-    const body = JSON.stringify(payload);
-    const signature = crypto
-      .createHmac('sha256', apiClient.private_key_hash)
-      .update(body)
-      .digest('hex');
-
-    try {
-      await axios.post(apiClient.webhook_url, payload, {
-        headers: {
-          'Content-Type': 'application/json',
-          'x-pulsemfb-signature': signature,
-          'x-pulsemfb-event': event,
-        },
-        timeout: 10000,
-      });
-
-      this.logger.log(`Webhook delivered: ${event} → ${apiClient.webhook_url}`);
-    } catch (err) {
-      // Log failure but do not throw — webhook delivery is fire-and-forget.
-      // A production system should enqueue retries via BullMQ.
-      this.logger.warn(
-        `Webhook delivery failed for client ${apiClient.id} | event: ${event} | error: ${err?.message}`,
-      );
-    }
+    this.logger.log(`Webhook job queued: ${event} → client ${apiClient.id}`);
   }
 }
