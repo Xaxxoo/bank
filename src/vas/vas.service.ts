@@ -191,23 +191,32 @@ export class VasService {
       select: ['account_number'],
     });
 
-    if (!clientAccounts.length) return [];
+    if (!clientAccounts.length) {
+      return { data: [], meta: { total: 0, page: 1, limit: dto.limit ?? 20, pages: 0 } };
+    }
 
     const accountNumbers = clientAccounts.map((a) => a.account_number);
+    const page = dto.page ?? 1;
+    const limit = dto.limit ?? 20;
 
     const qb = this.transactionRepo
       .createQueryBuilder('tx')
       .where('tx.debit_account_number IN (:...accountNumbers)', { accountNumbers })
       .andWhere('tx.channel = :channel', { channel: TransactionChannel.VAS })
       .orderBy('tx.created_at', 'DESC')
-      .take(dto.limit ?? 20);
+      .skip((page - 1) * limit)
+      .take(limit);
 
     if (dto.type) {
       qb.andWhere('tx.narration ILIKE :type', { type: `${dto.type}%` });
     }
 
-    const transactions = await qb.getMany();
-    return transactions.map(this.toVasResponse);
+    const [transactions, total] = await qb.getManyAndCount();
+
+    return {
+      data: transactions.map(this.toVasResponse),
+      meta: { total, page, limit, pages: Math.ceil(total / limit) },
+    };
   }
 
   // ─── Private Helpers ──────────────────────────────────────────────────────
