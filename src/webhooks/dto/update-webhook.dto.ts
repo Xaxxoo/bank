@@ -3,6 +3,7 @@ import { IsArray, IsEnum, IsOptional, IsUrl } from 'class-validator';
 export enum WebhookEvent {
   TRANSFER_COMPLETED = 'transfer.completed',
   TRANSFER_FAILED = 'transfer.failed',
+  TRANSFER_REVERSED = 'transfer.reversed',
   ACCOUNT_CREATED = 'account.created',
   VAS_COMPLETED = 'vas.completed',
   VAS_FAILED = 'vas.failed',
