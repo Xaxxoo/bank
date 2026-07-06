@@ -18,6 +18,8 @@ import { LedgerEntry, EntryType } from '../database/entities/ledger-entry.entity
 import { Account, AccountStatus } from '../database/entities/account.entity';
 import { ApiClient } from '../database/entities/api-client.entity';
 import { AnchorService } from '../providers/anchor/anchor.service';
+import { WebhooksService } from '../webhooks/webhooks.service';
+import { WebhookEvent } from '../webhooks/dto/update-webhook.dto';
 import { CreateTransferDto } from './dto/create-transfer.dto';
 import { NameEnquiryDto } from './dto/name-enquiry.dto';
 import { ListTransfersDto } from './dto/list-transfers.dto';
@@ -34,6 +36,7 @@ export class TransfersService {
     @InjectRepository(Account)
     private readonly accountRepo: Repository<Account>,
     private readonly anchorService: AnchorService,
+    private readonly webhooksService: WebhooksService,
     private readonly dataSource: DataSource,
   ) {}
 
@@ -88,10 +91,10 @@ export class TransfersService {
     });
 
     if (creditAccount) {
-      return this.executeInternalTransfer(dto, debitAccount, creditAccount, amountKobo);
+      return this.executeInternalTransfer(dto, debitAccount, creditAccount, amountKobo, apiClient);
     }
 
-    return this.executeNibssTransfer(dto, debitAccount, amountKobo);
+    return this.executeNibssTransfer(dto, debitAccount, amountKobo, apiClient);
   }
 
   // ─── Internal transfer (both accounts are in our DB) ──────────────────────
@@ -101,6 +104,7 @@ export class TransfersService {
     debitAccount: Account,
     creditAccount: Account,
     amountKobo: number,
+    apiClient: ApiClient,
   ) {
     if (creditAccount.status !== AccountStatus.ACTIVE) {
       throw new ForbiddenException(`Beneficiary account is ${creditAccount.status}`);
@@ -110,7 +114,6 @@ export class TransfersService {
       throw new BadRequestException('Cannot transfer to the same account');
     }
 
-    // Create the transaction record and settle it atomically in one DB transaction
     const transaction = await this.transactionRepo.save(
       this.transactionRepo.create({
         reference: dto.reference,
@@ -160,7 +163,11 @@ export class TransfersService {
 
     const settled = await this.transactionRepo.findOne({ where: { id: transaction.id } });
     this.logger.log(`Internal transfer ${dto.reference} settled instantly`);
-    return this.toTransferResponse(settled!);
+
+    const response = this.toTransferResponse(settled!);
+    await this.webhooksService.deliver(apiClient, WebhookEvent.TRANSFER_COMPLETED, response);
+
+    return response;
   }
 
   // ─── External transfer (NIBSS via Anchor) ─────────────────────────────────
@@ -169,6 +176,7 @@ export class TransfersService {
     dto: CreateTransferDto,
     debitAccount: Account,
     amountKobo: number,
+    apiClient: ApiClient,
   ) {
     if (!dto.beneficiary_bank_code) {
       throw new BadRequestException(
@@ -176,8 +184,6 @@ export class TransfersService {
       );
     }
 
-    // Create pending transaction record before calling Anchor —
-    // gives us an audit trail even if the provider call fails
     const transaction = await this.transactionRepo.save(
       this.transactionRepo.create({
         reference: dto.reference,
@@ -192,7 +198,6 @@ export class TransfersService {
     );
 
     try {
-      // Call Anchor → NIBSS NIP
       const anchorTransfer = await this.anchorService.initiateTransfer(
         debitAccount.provider_account_id,
         dto.beneficiary_account_number,
@@ -205,7 +210,6 @@ export class TransfersService {
       const anchorStatus = anchorTransfer.attributes.status;
       const newStatus = this.mapAnchorStatus(anchorStatus);
 
-      // Atomically debit ledger + update transaction status
       await this.dataSource.transaction(async (manager) => {
         if (newStatus !== TransactionStatus.FAILED) {
           const balanceBefore = debitAccount.balance_kobo;
@@ -239,7 +243,17 @@ export class TransfersService {
       this.logger.log(
         `NIBSS transfer ${dto.reference} → status: ${updated!.status} | sessionId: ${anchorTransfer.attributes.sessionId}`,
       );
-      return this.toTransferResponse(updated!);
+
+      const response = this.toTransferResponse(updated!);
+
+      // Fire webhook for immediately-terminal statuses
+      if (newStatus === TransactionStatus.COMPLETED) {
+        await this.webhooksService.deliver(apiClient, WebhookEvent.TRANSFER_COMPLETED, response);
+      } else if (newStatus === TransactionStatus.FAILED) {
+        await this.webhooksService.deliver(apiClient, WebhookEvent.TRANSFER_FAILED, response);
+      }
+
+      return response;
 
     } catch (err) {
       if (transaction?.id) {
@@ -247,6 +261,14 @@ export class TransfersService {
           status: TransactionStatus.FAILED,
           failure_reason: err?.message ?? 'Provider error',
         });
+        const failed = await this.transactionRepo.findOne({ where: { id: transaction.id } });
+        if (failed) {
+          await this.webhooksService.deliver(
+            apiClient,
+            WebhookEvent.TRANSFER_FAILED,
+            this.toTransferResponse(failed),
+          );
+        }
       }
       throw err;
     }
@@ -259,15 +281,13 @@ export class TransfersService {
 
     if (!transaction) throw new NotFoundException('Transfer not found');
 
-    // Verify the debit account belongs to this client
     await this.assertTransactionOwnership(transaction, apiClient.id);
 
-    // If still processing, check live status from Anchor and sync
     if (
       transaction.status === TransactionStatus.PROCESSING ||
       transaction.status === TransactionStatus.PENDING
     ) {
-      await this.syncTransactionStatus(transaction);
+      await this.syncTransactionStatus(transaction, apiClient);
     }
 
     const refreshed = await this.transactionRepo.findOne({ where: { reference } });
@@ -277,7 +297,6 @@ export class TransfersService {
   // ─── GET /transfers ───────────────────────────────────────────────────────
 
   async listTransfers(dto: ListTransfersDto, apiClient: ApiClient) {
-    // Get all account numbers that belong to this client
     const clientAccounts = await this.accountRepo.find({
       where: { api_client_id: apiClient.id },
       select: ['account_number'],
@@ -316,7 +335,16 @@ export class TransfersService {
     if (!account) throw new ForbiddenException('You do not have access to this transfer');
   }
 
-  private async syncTransactionStatus(transaction: Transaction): Promise<void> {
+  /**
+   * Polls Anchor for a live status update on a PENDING/PROCESSING transaction.
+   * When a final status is reached the DB is updated and a webhook is fired.
+   * Pass apiClient to enable webhook delivery; omit from internal callers that
+   * load the client themselves (e.g. TransferPollingProcessor).
+   */
+  async syncTransactionStatus(
+    transaction: Transaction,
+    apiClient?: ApiClient,
+  ): Promise<void> {
     if (!transaction.provider_reference) return;
 
     try {
@@ -332,14 +360,26 @@ export class TransfersService {
             failure_reason: anchorTransfer.attributes.responseMessage,
           }),
         });
+
+        if (apiClient) {
+          const refreshed = await this.transactionRepo.findOne({ where: { id: transaction.id } });
+          const response = this.toTransferResponse(refreshed!);
+
+          if (newStatus === TransactionStatus.COMPLETED) {
+            await this.webhooksService.deliver(apiClient, WebhookEvent.TRANSFER_COMPLETED, response);
+          } else if (newStatus === TransactionStatus.FAILED) {
+            await this.webhooksService.deliver(apiClient, WebhookEvent.TRANSFER_FAILED, response);
+          }
+        }
       }
     } catch (err) {
-      // Non-fatal — we tried to sync, log and move on
-      this.logger.warn(`Could not sync transfer status for ${transaction.reference}: ${err.message}`);
+      this.logger.warn(
+        `Could not sync transfer status for ${transaction.reference}: ${err.message}`,
+      );
     }
   }
 
-  private mapAnchorStatus(anchorStatus: string): TransactionStatus {
+  mapAnchorStatus(anchorStatus: string): TransactionStatus {
     const map: Record<string, TransactionStatus> = {
       PENDING: TransactionStatus.PENDING,
       PROCESSING: TransactionStatus.PROCESSING,
@@ -350,13 +390,13 @@ export class TransfersService {
     return map[anchorStatus] ?? TransactionStatus.PENDING;
   }
 
-  private toTransferResponse(tx: Transaction) {
+  toTransferResponse(tx: Transaction) {
     return {
       reference: tx.reference,
       debit_account_number: tx.debit_account_number,
       beneficiary_account_number: tx.credit_account_number,
       beneficiary_bank_code: tx.beneficiary_bank_code,
-      amount: tx.amount_kobo / 100,        // return in Naira
+      amount: tx.amount_kobo / 100,
       amount_kobo: tx.amount_kobo,
       narration: tx.narration,
       status: tx.status,
