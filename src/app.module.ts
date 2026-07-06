@@ -7,6 +7,7 @@ import { AccountsModule } from './accounts/accounts.module';
 import { TransfersModule } from './transfers/transfers.module';
 import { VasModule } from './vas/vas.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
+import { RedisModule } from './common/redis/redis.module';
 import { ApiClientController } from './api-client/api-client.controller';
 
 @Module({
@@ -16,6 +17,7 @@ import { ApiClientController } from './api-client/api-client.controller';
       inject: [ConfigService],
       useFactory: (config: ConfigService) => databaseConfig(config),
     }),
+    RedisModule,
     AuthModule,
     AccountsModule,
     TransfersModule,
