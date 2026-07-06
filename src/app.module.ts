@@ -10,6 +10,7 @@ import { VasModule } from './vas/vas.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
 import { RedisModule } from './common/redis/redis.module';
 import { TransferPollingModule } from './workers/transfer-polling/transfer-polling.module';
+import { HealthModule } from './health/health.module';
 import { ApiClientController } from './api-client/api-client.controller';
 
 @Module({
@@ -36,6 +37,7 @@ import { ApiClientController } from './api-client/api-client.controller';
     VasModule,
     WebhooksModule,
     TransferPollingModule,
+    HealthModule,
   ],
   controllers: [ApiClientController],
 })
