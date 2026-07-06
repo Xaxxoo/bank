@@ -3,6 +3,7 @@ import {
   ConflictException,
   NotFoundException,
   ForbiddenException,
+  BadRequestException,
   Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -10,6 +11,8 @@ import { Repository } from 'typeorm';
 import { Account, AccountType, AccountStatus } from '../database/entities/account.entity';
 import { ApiClient } from '../database/entities/api-client.entity';
 import { AnchorService } from '../providers/anchor/anchor.service';
+import { WebhooksService } from '../webhooks/webhooks.service';
+import { WebhookEvent } from '../webhooks/dto/update-webhook.dto';
 import { CreateAccountDto } from './dto/create-account.dto';
 
 @Injectable()
@@ -20,6 +23,7 @@ export class AccountsService {
     @InjectRepository(Account)
     private readonly accountRepo: Repository<Account>,
     private readonly anchorService: AnchorService,
+    private readonly webhooksService: WebhooksService,
   ) {}
 
   // ─── POST /accounts/prefix ────────────────────────────────────────────────
@@ -28,7 +32,6 @@ export class AccountsService {
     dto: CreateAccountDto,
     apiClient: ApiClient,
   ): Promise<AccountDetail> {
-    // 1. Idempotency — same reference from same client returns the existing account
     const existing = await this.accountRepo.findOne({
       where: { reference: dto.reference, api_client_id: apiClient.id },
     });
@@ -37,7 +40,6 @@ export class AccountsService {
       return this.toDetailResponse(existing);
     }
 
-    // 2. Prevent duplicate email/BVN per API client
     const duplicateBvn = await this.accountRepo.findOne({
       where: { bvn: dto.bvn, api_client_id: apiClient.id },
     });
@@ -45,7 +47,6 @@ export class AccountsService {
       throw new ConflictException('An account with this BVN already exists for your business');
     }
 
-    // 3. Create customer on Anchor
     const anchorCustomer = await this.anchorService.createCustomer(
       dto.customer_name,
       dto.customer_email,
@@ -53,10 +54,8 @@ export class AccountsService {
       dto.bvn,
     );
 
-    // 4. Create virtual deposit account on Anchor → get NUBAN
     const anchorAccount = await this.anchorService.createDepositAccount(anchorCustomer.id);
 
-    // 5. Persist to our DB
     const account = this.accountRepo.create({
       account_number: anchorAccount.attributes.accountNumber,
       account_type: AccountType.PREFIX,
@@ -73,7 +72,10 @@ export class AccountsService {
     await this.accountRepo.save(account);
     this.logger.log(`Account created: ${account.account_number} for client ${apiClient.id}`);
 
-    return this.toDetailResponse(account);
+    const response = this.toDetailResponse(account);
+    await this.webhooksService.deliver(apiClient, WebhookEvent.ACCOUNT_CREATED, response);
+
+    return response;
   }
 
   // ─── GET /accounts/:account_number/balance ────────────────────────────────
@@ -84,14 +86,12 @@ export class AccountsService {
   ): Promise<BalanceResponse> {
     const account = await this.findAndVerifyOwnership(accountNumber, apiClient.id);
 
-    // Fetch live balance from Anchor as the source of truth
     const anchorAccount = await this.anchorService.getDepositAccount(
       account.provider_account_id,
     );
 
     const balanceKobo = anchorAccount.attributes.balance;
 
-    // Keep our local balance in sync
     if (account.balance_kobo !== balanceKobo) {
       await this.accountRepo.update(account.id, { balance_kobo: balanceKobo });
     }
@@ -99,7 +99,7 @@ export class AccountsService {
     return {
       account_number: accountNumber,
       account_name: account.customer_name,
-      balance: balanceKobo / 100,           // in Naira
+      balance: balanceKobo / 100,
       balance_kobo: balanceKobo,
       currency: 'NGN',
     };
@@ -115,8 +115,63 @@ export class AccountsService {
     return this.toDetailResponse(account);
   }
 
+  // ─── PATCH /accounts/:account_number/freeze ───────────────────────────────
+
+  async freezeAccount(accountNumber: string, apiClient: ApiClient): Promise<AccountDetail> {
+    const account = await this.findAndVerifyOwnershipAnyStatus(accountNumber, apiClient.id);
+
+    if (account.status === AccountStatus.FROZEN) {
+      throw new BadRequestException('Account is already frozen');
+    }
+    if (account.status === AccountStatus.CLOSED) {
+      throw new BadRequestException('Cannot freeze a closed account');
+    }
+
+    await this.accountRepo.update(account.id, { status: AccountStatus.FROZEN });
+    const updated = await this.accountRepo.findOne({ where: { id: account.id } });
+    this.logger.log(`Account frozen: ${accountNumber} by client ${apiClient.id}`);
+    return this.toDetailResponse(updated!);
+  }
+
+  // ─── PATCH /accounts/:account_number/unfreeze ─────────────────────────────
+
+  async unfreezeAccount(accountNumber: string, apiClient: ApiClient): Promise<AccountDetail> {
+    const account = await this.findAndVerifyOwnershipAnyStatus(accountNumber, apiClient.id);
+
+    if (account.status === AccountStatus.ACTIVE) {
+      throw new BadRequestException('Account is already active');
+    }
+    if (account.status === AccountStatus.CLOSED) {
+      throw new BadRequestException('Cannot unfreeze a closed account');
+    }
+
+    await this.accountRepo.update(account.id, { status: AccountStatus.ACTIVE });
+    const updated = await this.accountRepo.findOne({ where: { id: account.id } });
+    this.logger.log(`Account unfrozen: ${accountNumber} by client ${apiClient.id}`);
+    return this.toDetailResponse(updated!);
+  }
+
+  // ─── PATCH /accounts/:account_number/close ────────────────────────────────
+
+  async closeAccount(accountNumber: string, apiClient: ApiClient): Promise<AccountDetail> {
+    const account = await this.findAndVerifyOwnershipAnyStatus(accountNumber, apiClient.id);
+
+    if (account.status === AccountStatus.CLOSED) {
+      throw new BadRequestException('Account is already closed');
+    }
+
+    await this.accountRepo.update(account.id, { status: AccountStatus.CLOSED });
+    const updated = await this.accountRepo.findOne({ where: { id: account.id } });
+    this.logger.log(`Account closed: ${accountNumber} by client ${apiClient.id}`);
+    return this.toDetailResponse(updated!);
+  }
+
   // ─── Private Helpers ──────────────────────────────────────────────────────
 
+  /**
+   * Finds an account and verifies ownership. Throws if the account is not ACTIVE.
+   * Used for operations that require an active account (balance, transfers, VAS).
+   */
   private async findAndVerifyOwnership(
     accountNumber: string,
     apiClientId: string,
@@ -127,13 +182,33 @@ export class AccountsService {
 
     if (!account) throw new NotFoundException('Account not found');
 
-    // Prevent cross-client data access
     if (account.api_client_id !== apiClientId) {
       throw new ForbiddenException('You do not have access to this account');
     }
 
     if (account.status !== AccountStatus.ACTIVE) {
       throw new ForbiddenException(`Account is ${account.status}`);
+    }
+
+    return account;
+  }
+
+  /**
+   * Finds an account and verifies ownership regardless of status.
+   * Used for freeze/unfreeze/close operations.
+   */
+  private async findAndVerifyOwnershipAnyStatus(
+    accountNumber: string,
+    apiClientId: string,
+  ): Promise<Account> {
+    const account = await this.accountRepo.findOne({
+      where: { account_number: accountNumber },
+    });
+
+    if (!account) throw new NotFoundException('Account not found');
+
+    if (account.api_client_id !== apiClientId) {
+      throw new ForbiddenException('You do not have access to this account');
     }
 
     return account;
