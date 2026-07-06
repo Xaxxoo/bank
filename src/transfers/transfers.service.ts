@@ -82,8 +82,102 @@ export class TransfersService {
       throw new UnprocessableEntityException('Insufficient balance');
     }
 
-    // 4. Create pending transaction record before calling Anchor
-    //    If anything fails after this point, we have a record to reconcile
+    // 4. Route: internal (beneficiary in our DB) vs external (NIBSS via Anchor)
+    const creditAccount = await this.accountRepo.findOne({
+      where: { account_number: dto.beneficiary_account_number },
+    });
+
+    if (creditAccount) {
+      return this.executeInternalTransfer(dto, debitAccount, creditAccount, amountKobo);
+    }
+
+    return this.executeNibssTransfer(dto, debitAccount, amountKobo);
+  }
+
+  // ─── Internal transfer (both accounts are in our DB) ──────────────────────
+
+  private async executeInternalTransfer(
+    dto: CreateTransferDto,
+    debitAccount: Account,
+    creditAccount: Account,
+    amountKobo: number,
+  ) {
+    if (creditAccount.status !== AccountStatus.ACTIVE) {
+      throw new ForbiddenException(`Beneficiary account is ${creditAccount.status}`);
+    }
+
+    if (debitAccount.account_number === creditAccount.account_number) {
+      throw new BadRequestException('Cannot transfer to the same account');
+    }
+
+    // Create the transaction record and settle it atomically in one DB transaction
+    const transaction = await this.transactionRepo.save(
+      this.transactionRepo.create({
+        reference: dto.reference,
+        debit_account_number: dto.debit_account_number,
+        credit_account_number: dto.beneficiary_account_number,
+        amount_kobo: amountKobo,
+        narration: dto.narration,
+        status: TransactionStatus.PENDING,
+        channel: TransactionChannel.INTERNAL,
+      }),
+    );
+
+    await this.dataSource.transaction(async (manager) => {
+      const debitBefore = debitAccount.balance_kobo;
+      const debitAfter = debitBefore - amountKobo;
+      const creditBefore = creditAccount.balance_kobo;
+      const creditAfter = creditBefore + amountKobo;
+
+      // Debit leg
+      await manager.save(LedgerEntry, {
+        account_id: debitAccount.id,
+        transaction_id: transaction.id,
+        type: EntryType.DEBIT,
+        amount_kobo: amountKobo,
+        balance_before_kobo: debitBefore,
+        balance_after_kobo: debitAfter,
+        narration: dto.narration,
+      });
+      await manager.update(Account, debitAccount.id, { balance_kobo: debitAfter });
+
+      // Credit leg
+      await manager.save(LedgerEntry, {
+        account_id: creditAccount.id,
+        transaction_id: transaction.id,
+        type: EntryType.CREDIT,
+        amount_kobo: amountKobo,
+        balance_before_kobo: creditBefore,
+        balance_after_kobo: creditAfter,
+        narration: dto.narration,
+      });
+      await manager.update(Account, creditAccount.id, { balance_kobo: creditAfter });
+
+      await manager.update(Transaction, transaction.id, {
+        status: TransactionStatus.COMPLETED,
+      });
+    });
+
+    const settled = await this.transactionRepo.findOne({ where: { id: transaction.id } });
+    this.logger.log(`Internal transfer ${dto.reference} settled instantly`);
+    return this.toTransferResponse(settled!);
+  }
+
+  // ─── External transfer (NIBSS via Anchor) ─────────────────────────────────
+
+  private async executeNibssTransfer(
+    dto: CreateTransferDto,
+    debitAccount: Account,
+    amountKobo: number,
+  ) {
+    if (!dto.beneficiary_bank_code) {
+      throw new BadRequestException(
+        'beneficiary_bank_code is required for transfers to external banks',
+      );
+    }
+
+    // Create pending transaction record before calling Anchor —
+    // gives us an audit trail even if the provider call fails
     const transaction = await this.transactionRepo.save(
       this.transactionRepo.create({
         reference: dto.reference,
@@ -98,7 +192,7 @@ export class TransfersService {
     );
 
     try {
-      // 5. Call Anchor → NIBSS NIP
+      // Call Anchor → NIBSS NIP
       const anchorTransfer = await this.anchorService.initiateTransfer(
         debitAccount.provider_account_id,
         dto.beneficiary_account_number,
@@ -109,12 +203,10 @@ export class TransfersService {
       );
 
       const anchorStatus = anchorTransfer.attributes.status;
-      const isFinal = anchorStatus === 'SUCCESSFUL' || anchorStatus === 'FAILED';
       const newStatus = this.mapAnchorStatus(anchorStatus);
 
-      // 6. Use a DB transaction to atomically debit ledger + update transaction status
+      // Atomically debit ledger + update transaction status
       await this.dataSource.transaction(async (manager) => {
-        // Only debit ledger if Anchor confirms the transfer is in motion
         if (newStatus !== TransactionStatus.FAILED) {
           const balanceBefore = debitAccount.balance_kobo;
           const balanceAfter = balanceBefore - amountKobo;
@@ -129,9 +221,7 @@ export class TransfersService {
             narration: dto.narration,
           });
 
-          await manager.update(Account, debitAccount.id, {
-            balance_kobo: balanceAfter,
-          });
+          await manager.update(Account, debitAccount.id, { balance_kobo: balanceAfter });
         }
 
         await manager.update(Transaction, transaction.id, {
@@ -147,12 +237,11 @@ export class TransfersService {
 
       const updated = await this.transactionRepo.findOne({ where: { id: transaction.id } });
       this.logger.log(
-        `Transfer ${dto.reference} → status: ${updated!.status} | sessionId: ${anchorTransfer.attributes.sessionId}`,
+        `NIBSS transfer ${dto.reference} → status: ${updated!.status} | sessionId: ${anchorTransfer.attributes.sessionId}`,
       );
       return this.toTransferResponse(updated!);
 
     } catch (err) {
-      // If Anchor call itself failed, mark transaction as failed
       if (transaction?.id) {
         await this.transactionRepo.update(transaction.id, {
           status: TransactionStatus.FAILED,
