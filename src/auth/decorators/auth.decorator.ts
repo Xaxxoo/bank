@@ -1,6 +1,7 @@
 import { SetMetadata, createParamDecorator, ExecutionContext, applyDecorators, UseGuards } from '@nestjs/common';
 import { ApiKeyGuard } from '../guards/api-key.guard';
 import { HmacGuard } from '../guards/hmac.guard';
+import { RateLimitGuard } from '../../common/guards/rate-limit.guard';
 import { ApiClient } from '../../database/entities/api-client.entity';
 
 export const PERMISSIONS_KEY = 'permissions';
@@ -15,7 +16,7 @@ export const PERMISSIONS_KEY = 'permissions';
 export const UseApiKey = (...permissions: string[]) =>
   applyDecorators(
     SetMetadata(PERMISSIONS_KEY, permissions),
-    UseGuards(ApiKeyGuard),
+    UseGuards(ApiKeyGuard, RateLimitGuard),
   );
 
 /**
@@ -28,7 +29,7 @@ export const UseApiKey = (...permissions: string[]) =>
 export const UseHmac = (...permissions: string[]) =>
   applyDecorators(
     SetMetadata(PERMISSIONS_KEY, permissions),
-    UseGuards(HmacGuard),
+    UseGuards(HmacGuard, RateLimitGuard),
   );
 
 /**
