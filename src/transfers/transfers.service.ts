@@ -302,22 +302,113 @@ export class TransfersService {
       select: ['account_number'],
     });
 
-    if (!clientAccounts.length) return [];
+    if (!clientAccounts.length) {
+      return { data: [], meta: { total: 0, page: 1, limit: dto.limit ?? 20, pages: 0 } };
+    }
 
     const accountNumbers = clientAccounts.map((a) => a.account_number);
+    const page = dto.page ?? 1;
+    const limit = dto.limit ?? 20;
 
     const qb = this.transactionRepo
       .createQueryBuilder('tx')
       .where('tx.debit_account_number IN (:...accountNumbers)', { accountNumbers })
       .orderBy('tx.created_at', 'DESC')
-      .take(dto.limit ?? 20);
+      .skip((page - 1) * limit)
+      .take(limit);
 
     if (dto.status) {
       qb.andWhere('tx.status = :status', { status: dto.status });
     }
 
-    const transactions = await qb.getMany();
-    return transactions.map(this.toTransferResponse);
+    const [transactions, total] = await qb.getManyAndCount();
+
+    return {
+      data: transactions.map(this.toTransferResponse),
+      meta: { total, page, limit, pages: Math.ceil(total / limit) },
+    };
+  }
+
+  // ─── POST /transfers/:reference/reverse ───────────────────────────────────
+
+  async reverseTransfer(reference: string, apiClient: ApiClient) {
+    const transaction = await this.transactionRepo.findOne({ where: { reference } });
+
+    if (!transaction) throw new NotFoundException('Transfer not found');
+    await this.assertTransactionOwnership(transaction, apiClient.id);
+
+    if (transaction.status === TransactionStatus.REVERSED) {
+      throw new BadRequestException('Transfer has already been reversed');
+    }
+    if (transaction.status !== TransactionStatus.COMPLETED) {
+      throw new BadRequestException(
+        `Only completed transfers can be reversed. Current status: ${transaction.status}`,
+      );
+    }
+
+    // Find all debit ledger entries for this transaction
+    const debitEntries = await this.ledgerRepo.find({
+      where: { transaction_id: transaction.id, type: EntryType.DEBIT },
+    });
+
+    await this.dataSource.transaction(async (manager) => {
+      for (const entry of debitEntries) {
+        const account = await this.accountRepo.findOne({ where: { id: entry.account_id } });
+        if (!account) continue;
+
+        const balanceBefore = account.balance_kobo;
+        const balanceAfter = balanceBefore + entry.amount_kobo;
+
+        // Credit back the debited account
+        await manager.save(LedgerEntry, {
+          account_id: account.id,
+          transaction_id: transaction.id,
+          type: EntryType.CREDIT,
+          amount_kobo: entry.amount_kobo,
+          balance_before_kobo: balanceBefore,
+          balance_after_kobo: balanceAfter,
+          narration: `Reversal: ${reference}`,
+        });
+
+        await manager.update(Account, account.id, { balance_kobo: balanceAfter });
+      }
+
+      // For internal transfers, also debit the credited account
+      if (transaction.channel === TransactionChannel.INTERNAL && transaction.credit_account_number) {
+        const creditAccount = await this.accountRepo.findOne({
+          where: { account_number: transaction.credit_account_number },
+        });
+
+        if (creditAccount) {
+          const balanceBefore = creditAccount.balance_kobo;
+          const balanceAfter = Math.max(0, balanceBefore - transaction.amount_kobo);
+
+          await manager.save(LedgerEntry, {
+            account_id: creditAccount.id,
+            transaction_id: transaction.id,
+            type: EntryType.DEBIT,
+            amount_kobo: transaction.amount_kobo,
+            balance_before_kobo: balanceBefore,
+            balance_after_kobo: balanceAfter,
+            narration: `Reversal: ${reference}`,
+          });
+
+          await manager.update(Account, creditAccount.id, { balance_kobo: balanceAfter });
+        }
+      }
+
+      await manager.update(Transaction, transaction.id, {
+        status: TransactionStatus.REVERSED,
+      });
+    });
+
+    const reversed = await this.transactionRepo.findOne({ where: { id: transaction.id } });
+    const response = this.toTransferResponse(reversed!);
+
+    await this.webhooksService.deliver(apiClient, WebhookEvent.TRANSFER_REVERSED, response);
+    this.logger.log(`Transfer reversed: ${reference}`);
+
+    return response;
   }
 
   // ─── Private Helpers ──────────────────────────────────────────────────────
