@@ -7,6 +7,7 @@ import {
   Param,
   Post,
   Query,
+  Patch,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiSecurity, ApiParam, ApiQuery, ApiResponse } from '@nestjs/swagger';
 import { TransfersService } from './transfers.service';
@@ -79,5 +80,25 @@ export class TransfersController {
   ) {
     const data = await this.transfersService.getTransfer(reference, client);
     return { statusCode: 200, message: 'Transfer retrieved successfully', data };
+  }
+
+  @Patch(':reference/reverse')
+  @HttpCode(HttpStatus.OK)
+  @UseApiKey('transfers:write')
+  @ApiOperation({
+    summary: 'Reverse a completed transfer',
+    description:
+      'Creates reversal ledger entries and restores account balances. ' +
+      'Only COMPLETED transfers can be reversed.',
+  })
+  @ApiParam({ name: 'reference', example: 'ref-txn-001' })
+  @ApiResponse({ status: 200, description: 'Transfer reversed successfully' })
+  @ApiResponse({ status: 400, description: 'Transfer is not in a reversible state' })
+  async reverseTransfer(
+    @Param('reference') reference: string,
+    @ApiClientContext() client: ApiClient,
+  ) {
+    const data = await this.transfersService.reverseTransfer(reference, client);
+    return { statusCode: 200, message: 'Transfer reversed successfully', data };
   }
 }
